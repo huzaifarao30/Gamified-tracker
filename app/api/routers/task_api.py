@@ -1,56 +1,92 @@
-from fastapi import APIRouter , HTTPException ,status
 from typing import List
-from app.schemas.task_schemas import taskCreate , taskResponse , taskUpdate
-from app.core.fake_db import task_db,tasks_counter
+from bson import ObjectId, errors as bson_errors  # ADDED: Added bson_errors to catch bad ID formats
+from fastapi import APIRouter, HTTPException, status
+from pymongo.errors import PyMongoError
 
-taskRouter = APIRouter(prefix="/tasks" , tags = ["Tasks"])
+from app.core.database import task_collection
+from app.schemas.task_schemas import taskCreate, taskResponse, taskUpdate
 
-@taskRouter.post("/" , response_model=taskResponse , status_code=status.HTTP_201_CREATED)
-def create_task(taskdata : taskCreate):
-    global tasks_counter
-    new_task = {"id" : tasks_counter, "name" : taskdata.name , "difficulty" : taskdata.difficulty , "completed" : False}
-    task_db[tasks_counter] = new_task
-    tasks_counter += 1
-    return new_task
+taskRouter = APIRouter(prefix="/tasks", tags=["Tasks"])
 
-@taskRouter.get("/tasks", response_model=List[taskResponse])
+def get_object_id(id_str: str):
+    try:
+        return ObjectId(id_str)
+    except bson_errors.InvalidId:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, 
+            detail="Invalid ID format"
+        )
+
+@taskRouter.post("/", response_model=taskResponse, status_code=status.HTTP_201_CREATED)
+def create_task(taskdata: taskCreate):
+    try:
+        task_dict = taskdata.model_dump()
+        result = task_collection.insert_one(task_dict)
+        task_dict["id"] = str(result.inserted_id)
+        return task_dict
+    except PyMongoError as e:
+        print(f"Database insertion failed: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An error occurred while saving the task.",
+        ) from e
+
+@taskRouter.get("/", response_model=List[taskResponse])
 def get_all_tasks():
-    return list(task_db.values())
-
-@taskRouter.get("/tasks/{task_id}", response_model=taskResponse)
-def get_task(task_id: int):
-    if task_id not in task_db:
+    try:
+        tasks = list(task_collection.find({}))
+        for task in tasks:
+            task["id"] = str(task.pop("_id"))
+        return tasks
+    except PyMongoError as e:
+        print(f"Database fetch failed: {e}")
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, 
-            detail=f"Task with ID {task_id} not found."
-        )
-    
-    return task_db[task_id]
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="An error occurred while fetching tasks.",
+        ) from e
 
-@taskRouter.patch("/tasks/{task_id}", response_model=taskResponse)
-def update_task(task_id: int, update_data: taskUpdate):
-    if task_id not in task_db:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, 
-            detail="Task not found."
-        )
-    existing_task = task_db[task_id]
-    update_dictionary = update_data.model_dump(exclude_unset=True)
-    for key, value in update_dictionary.items():
-        existing_task[key] = value
-    return existing_task
+@taskRouter.get("/{task_id}", response_model=taskResponse)
+def get_task(task_id: str):
+    obj_id = get_object_id(task_id)
+    try:
+        task = task_collection.find_one({"_id": obj_id})
+    except PyMongoError as e:
+        raise HTTPException(status_code=500, detail="Database error") from e
 
-@taskRouter.delete("/tasks/{task_id}", status_code=status.HTTP_200_OK)
-def delete_task(task_id: int):
-    if task_id not in task_db:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, 
-            detail="Task not found."
+    if not task:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
+
+    task["id"] = str(task.pop("_id"))
+    return task
+
+@taskRouter.patch("/{task_id}", response_model=taskResponse)
+def update_task(task_id: str, update_data: taskUpdate):
+    obj_id = get_object_id(task_id)
+    try:
+        update_dict = update_data.model_dump(exclude_unset=True)
+        result = task_collection.find_one_and_update(
+            {"_id": obj_id},
+            {"$set": update_dict},
+            return_document=True,
         )
-    
-    del task_db[task_id]
-    
+    except PyMongoError as e:
+        raise HTTPException(status_code=500, detail="Database error") from e
+
+    if not result:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
+
+    result["id"] = str(result.pop("_id"))
+    return result
+
+@taskRouter.delete("/{task_id}", status_code=status.HTTP_200_OK)
+def delete_task(task_id: str):
+    obj_id = get_object_id(task_id)
+    try:
+        result = task_collection.delete_one({"_id": obj_id})
+    except PyMongoError as e:
+        raise HTTPException(status_code=500, detail="Database error") from e
+
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Task not found.")
+
     return {"message": f"Task {task_id} deleted successfully"}
-
-
-
